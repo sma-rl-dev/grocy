@@ -1,0 +1,90 @@
+# syntax=docker/dockerfile:1
+# tester-env source build for Grocy v4.7.1 (7d15c46bbdc35d4958cae99209ba170667dc1d64).
+#
+# Upstream publishes no Dockerfile (its README points Docker users at a
+# third-party image), so this mirrors the documented source install: composer
+# into ./packages, yarn 1 into ./public/packages, Apache document root public/.
+#
+# public/js is plain editable JavaScript served as-is, so there is no frontend
+# build. The only real build cost is the dependency layer (two composer VCS
+# branches plus the yarn 1 tree). It is built in its own stage from
+# composer.json/composer.lock and package.json/yarn.lock only, so source edits
+# reuse it: cold build ~2-3 min, incremental source change ~8-10 s.
+
+ARG PHP_IMAGE=php:8.5-apache
+# node >= 24 is required by @zxing/library 0.23 (engine field in yarn.lock).
+ARG NODE_IMAGE=node:24-bookworm
+
+# ---------------------------------------------------------------------------
+# PHP 8.5 + Apache; extensions required by helpers/PrerequisiteChecker.php
+# ---------------------------------------------------------------------------
+FROM ${PHP_IMAGE} AS base
+ENV APACHE_DOCUMENT_ROOT=/var/www/html/public
+
+# Migration 0027 hashes the default admin password with PASSWORD_ARGON2ID, so a
+# PHP build without argon2 support fails the very first GET /.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        git unzip libicu-dev libpng-dev libjpeg62-turbo-dev libfreetype6-dev libonig-dev libsqlite3-dev; \
+    rm -rf /var/lib/apt/lists/*; \
+    docker-php-ext-configure gd --with-freetype --with-jpeg; \
+    docker-php-ext-install -j"$(nproc)" gd intl pdo_sqlite mbstring; \
+    php -r 'defined("PASSWORD_ARGON2ID") or exit("PHP lacks argon2 password support\n");'
+
+# Grocy stores local datetimes; a fixed zone keeps date-bearing views stable.
+RUN { echo 'date.timezone = UTC'; echo 'memory_limit = 512M'; } \
+        > /usr/local/etc/php/conf.d/tester-env.ini
+
+RUN sed -ri -e "s!/var/www/html!${APACHE_DOCUMENT_ROOT}!g" \
+        /etc/apache2/sites-available/*.conf /etc/apache2/apache2.conf /etc/apache2/conf-enabled/*.conf
+
+# public/.htaccess contains RewriteRules; without mod_rewrite Apache refuses to
+# serve the directory at all (500), even though DISABLE_URL_REWRITING means the
+# app never relies on rewriting.
+RUN a2enmod rewrite
+
+# ---------------------------------------------------------------------------
+# Composer dependencies (vendor-dir is ./packages)
+# ---------------------------------------------------------------------------
+FROM base AS vendor
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+WORKDIR /app
+COPY composer.json composer.lock ./
+RUN --mount=type=cache,target=/composer-cache \
+    COMPOSER_CACHE_DIR=/composer-cache composer install \
+        --no-dev --no-scripts --no-autoloader --prefer-dist --no-interaction --no-progress
+
+# ---------------------------------------------------------------------------
+# Browser assets (yarn 1 classic; .yarnrc sets --modules-folder public/packages)
+# ---------------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS assets
+WORKDIR /build
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends git ca-certificates; \
+    rm -rf /var/lib/apt/lists/*
+COPY package.json yarn.lock .yarnrc ./
+RUN --mount=type=cache,target=/yarn-cache \
+    YARN_CACHE_FOLDER=/yarn-cache yarn install --non-interactive --frozen-lockfile \
+    && test -d public/packages/bootstrap
+
+# ---------------------------------------------------------------------------
+# Runtime image
+# ---------------------------------------------------------------------------
+FROM base AS runtime
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+WORKDIR /var/www/html
+
+# Dependencies before source so PHP/JS edits only re-run dump-autoload.
+COPY --from=vendor /app/packages ./packages
+COPY --from=assets /build/public/packages ./public/packages
+
+COPY . .
+RUN composer dump-autoload --no-dev --optimize --no-interaction
+
+COPY docker/tester-env-entrypoint.sh /usr/local/bin/tester-env-entrypoint.sh
+RUN chmod +x /usr/local/bin/tester-env-entrypoint.sh
+
+EXPOSE 80
+ENTRYPOINT ["/usr/local/bin/tester-env-entrypoint.sh"]

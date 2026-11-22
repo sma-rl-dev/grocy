@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Grocy - Tester Environment CLI
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+# Commands: deploy, seed, verify, reset, stop, logs, status, help
+
+RUN_ID="default"
+PORT="8088"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.tester-env.yml"
+
+CREDENTIALS_USERNAME="admin"
+CREDENTIALS_PASSWORD="admin"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+
+    CONTAINER_NAME="tester-env-grocy${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-grocy:dev}"
+    COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-tester-env-grocy${suffix}}"
+    DATA_DIR="${SCRIPT_DIR}/.tester-env-data${suffix}"
+    # Grocy builds its own absolute URLs from the request host, so the runner's
+    # browser origin needs no configuration; this is for status output only.
+    APP_URL="${APP_URL:-${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}}"
+}
+
+compose() {
+    docker compose \
+        -p "${COMPOSE_PROJECT}" \
+        -f "${COMPOSE_FILE}" \
+        --project-directory "${SCRIPT_DIR}" \
+        "$@"
+}
+
+compose_env() {
+    COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT}" \
+    CONTAINER_NAME="${CONTAINER_NAME}" \
+    IMAGE_TAG="${IMAGE_NAME}" \
+    PORT="${PORT}" \
+    DATA_DIR="${DATA_DIR}" \
+    compose "$@"
+}
+
+http_code() {
+    curl -s -o /dev/null -w '%{http_code}' "$@" || true
+}
+
+wait_for_health() {
+    local attempt code
+    for attempt in $(seq 1 30); do
+        # GET / is the only route that runs database migrations
+        # (SystemController::Root), so this also creates admin/admin. The very
+        # first request only redirects to itself after touching the config hash
+        # cache, so redirects must be followed to reach the migration request.
+        code=$(curl -sL --max-redirs 10 --max-time 120 -o /dev/null -w '%{http_code}' \
+            "http://localhost:${PORT}/" || true)
+        if [[ "${code}" == "200" ]]; then
+            echo "==> App healthy after ${attempt}s (GET / followed redirects to HTTP 200)"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "Error: app did not become healthy at http://localhost:${PORT}/" >&2
+    compose_env logs --tail 80 >&2 || true
+    exit 1
+}
+
+cmd_deploy() {
+    echo "==> Preparing data directory (${DATA_DIR})..."
+    mkdir -p "${DATA_DIR}"
+
+    echo "==> Building image from source: ${IMAGE_NAME}..."
+    echo "    (cold build installs composer packages + yarn public/packages; source edits reuse them)"
+    compose_env build
+
+    echo "==> Starting container ${CONTAINER_NAME} on port ${PORT}..."
+    compose_env up -d --no-build
+
+    wait_for_health
+    cmd_verify --quiet
+
+    echo "==> Deployment complete."
+    echo "    URL:   http://localhost:${PORT}/"
+    echo "    Login: ${CREDENTIALS_USERNAME} / ${CREDENTIALS_PASSWORD}"
+}
+
+require_running() {
+    if ! compose_env ps --status running --format '{{.Name}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"; then
+        echo "Error: container ${CONTAINER_NAME} is not running. Run './tester-env deploy' first." >&2
+        exit 1
+    fi
+}
+
+# Deterministic seed data lives in tester-env-seed.py (same directory): it
+# creates the household master data, stock entries, shopping lists, chores,
+# tasks and one recipe through the Grocy API. See tester-env-seed.json.
+SEED_SCRIPT="${SCRIPT_DIR}/tester-env-seed.py"
+
+cmd_seed() {
+    require_running
+    command -v python3 >/dev/null 2>&1 || {
+        echo "Error: python3 is required for the seed/verify script." >&2
+        exit 1
+    }
+    [[ -f "${SEED_SCRIPT}" ]] || {
+        echo "Error: ${SEED_SCRIPT} is missing." >&2
+        exit 1
+    }
+    echo "==> Ensuring schema migration (GET / followed redirects)..."
+    wait_for_health
+    python3 "${SEED_SCRIPT}" seed "http://localhost:${PORT}"
+}
+
+cmd_verify() {
+    local quiet="${1:-}"
+    require_running
+    [[ "${quiet}" == "--quiet" ]] || echo "==> Verifying login and the stock overview page over HTTP..."
+
+    local cookie_jar code body
+    cookie_jar="$(mktemp)"
+    body="$(mktemp)"
+    trap 'rm -f "${cookie_jar:-}" "${body:-}"' EXIT
+
+    code=$(http_code -c "${cookie_jar}" "http://localhost:${PORT}/login")
+    if [[ "${code}" != "200" ]]; then
+        echo "Error: login page /login returned HTTP ${code}." >&2
+        exit 1
+    fi
+    [[ "${quiet}" == "--quiet" ]] || echo "    login page: HTTP 200"
+
+    # DefaultAuthMiddleware::ProcessLogin accepts a plain form post; a success
+    # is a 302 back to / plus the grocy_session_access_token cookie.
+    code=$(http_code -b "${cookie_jar}" -c "${cookie_jar}" \
+        -X POST "http://localhost:${PORT}/login" \
+        --data-urlencode "username=${CREDENTIALS_USERNAME}" \
+        --data-urlencode "password=${CREDENTIALS_PASSWORD}")
+    if [[ "${code}" != "302" ]] || ! grep -q "grocy_session_access_token" "${cookie_jar}"; then
+        echo "Error: login as ${CREDENTIALS_USERNAME} returned HTTP ${code} without a session cookie." >&2
+        exit 1
+    fi
+    [[ "${quiet}" == "--quiet" ]] || echo "    login:      ${CREDENTIALS_USERNAME} -> HTTP 302 + session cookie"
+
+    code=$(curl -s -o "${body}" -w '%{http_code}' -b "${cookie_jar}" \
+        "http://localhost:${PORT}/stockoverview")
+    if [[ "${code}" != "200" ]] || ! grep -q "Stock overview" "${body}"; then
+        echo "Error: authenticated /stockoverview returned HTTP ${code} without the stock overview page." >&2
+        exit 1
+    fi
+    [[ "${quiet}" == "--quiet" ]] || echo "    stock:      /stockoverview renders 'Stock overview'"
+
+    # deploy's health gate must not require seed data; the explicit verify does.
+    if [[ "${quiet}" != "--quiet" ]]; then
+        python3 "${SEED_SCRIPT}" verify "http://localhost:${PORT}"
+    fi
+
+    echo "==> Verify passed."
+}
+
+cmd_reset() {
+    echo "==> Resetting environment..."
+    compose_env down -v --remove-orphans || true
+    if [[ -d "${DATA_DIR}" ]]; then
+        # /data is written by www-data (uid 33), so a plain host-side rm can hit
+        # permission errors. Delete the contents through the built image as root
+        # (one bind mount, no network) before removing the directory itself.
+        if docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
+            docker run --rm --network none --entrypoint sh -v "${DATA_DIR}:/data" "${IMAGE_NAME}" \
+                -c 'rm -rf /data/* /data/.[!.]* /data/..?* 2>/dev/null; true'
+        fi
+        rm -rf "${DATA_DIR}" 2>/dev/null || true
+    fi
+    echo "==> Reset complete (container, data dir and ${DATA_DIR} removed). Run 'deploy' to start fresh."
+}
+
+cmd_stop() {
+    echo "==> Stopping container (data preserved)..."
+    compose_env stop
+}
+
+cmd_logs() {
+    compose_env logs -f --tail 100 "$@"
+}
+
+cmd_status() {
+    if compose_env ps --status running --format '{{.Name}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"; then
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}/"
+        echo "Browser URL: ${APP_URL}/"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Image: ${IMAGE_NAME}"
+        echo "Data: ${DATA_DIR}"
+        echo "Credentials: ${CREDENTIALS_USERNAME} / ${CREDENTIALS_PASSWORD}"
+    else
+        echo "Status: NOT RUNNING"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+Grocy - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build the image from source, start the container, verify login
+  seed      Create the deterministic household data set (12 products, 11 stock
+            entries, 2 shopping lists, 4 chores, 3 tasks, 1 recipe)
+  verify    Assert login and the stock overview page over HTTP, plus every
+            seeded entity, count, amount, fixed date and rendered page
+  reset     Remove container, volumes and the host data directory
+  stop      Stop the container (data preserved)
+  logs      Tail container logs
+  status    Show container status, URL and credentials
+  help      Show this help message
+
+Options:
+  --run-id <id>   Isolate container, compose project and data dir for parallel runs. Default: default
+  --port <port>   Host port to bind to container port 80. Default: 8088
+
+Typical workflow:
+  ./tester-env deploy    # Build, start, migrate and verify
+  ./tester-env seed      # Create the deterministic household data
+  ./tester-env verify    # Assert seeded data (pages + API)
+  ./tester-env reset     # Clean slate (data/ removed)
+
+Deployment details:
+  - Baseline: v4.7.1 (7d15c46bbdc35d4958cae99209ba170667dc1d64)
+  - Dockerfile.tester-env builds php:8.5-apache with gd/intl/pdo_sqlite/
+    mbstring (argon2 support is asserted at build time), composer packages in
+    ./packages and yarn public/packages from cached dependency stages.
+  - Apache document root is public/ with mod_rewrite enabled, so pages are
+    served at /stockoverview, /login, ... (upstream default URL scheme).
+  - All state lives in the ./.tester-env-data bind mount at /data: config.php
+    (created from config-dist.php on first start), grocy.db and viewcache.
+  - GET / runs the migrations that create the admin/admin user; deploy polls it.
+  - Deterministic credentials: admin / admin, ADMIN permissions.
+  - MODE=production (demo mode is auth-disabled and week-relative, so it is not
+    used), DEFAULT_LOCALE=en, STOCK_BARCODE_LOOKUP_PLUGIN empty (no outbound
+    barcode lookups), TZ/date.timezone=UTC.
+  - Seed data comes from tester-env-seed.py through the session-cookie API:
+    4 locations (Fridge is the migration default), 5 quantity units, 6 product
+    groups, 2 shopping locations, 12 products, 11 stock entries with fixed
+    purchase/best-before dates, 2 shopping lists, 4 chores, 3 tasks and one
+    recipe. Re-running seed wipes and recreates only that data.
+
+Environment:
+  IMAGE_TAG       Content-addressed image tag exported by scripts/rl-env
+  TESTER_ENV_BROWSER_ORIGIN  Browser-visible origin, used by 'status' only
+
+Caveats:
+  - public/js is editable source served as-is; no frontend build step.
+  - Composer install pulls two VCS dev branches (berrnd/lessql,
+    berrnd/php-gettext), so the first build needs network access.
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --run-id)
+                RUN_ID="${2:?--run-id requires a value}"
+                shift 2
+                ;;
+            --port)
+                PORT="${2:?--port requires a value}"
+                shift 2
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                cmd_help
+                exit 1
+                ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            echo "Unknown command: ${cmd}" >&2
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

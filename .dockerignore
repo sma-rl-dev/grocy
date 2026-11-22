@@ -1,0 +1,8 @@
+.git
+.gitignore
+packages
+public/packages
+data
+.tester-env-data*
+__pycache__
+node_modules

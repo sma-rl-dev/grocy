@@ -1,0 +1,35 @@
+# tester-env compose file for Grocy (single Apache/PHP container, SQLite in
+# /data). The tester-env CLI is the supported entry point; it supplies
+# IMAGE_TAG, PORT, DATA_DIR and COMPOSE_PROJECT_NAME. Direct
+# `docker compose -f docker-compose.tester-env.yml up --build` also works on
+# port 8088 with the defaults below.
+name: ${COMPOSE_PROJECT_NAME:-tester-env-grocy}
+
+services:
+  grocy:
+    build:
+      context: .
+      dockerfile: Dockerfile.tester-env
+    image: ${IMAGE_TAG:-tester-env-grocy:dev}
+    container_name: ${CONTAINER_NAME:-tester-env-grocy}
+    environment:
+      # GROCY_* environment variables outrank data/config.php and
+      # config-dist.php defaults (helpers/extensions.php Setting()).
+      GROCY_DATAPATH: /data
+      GROCY_MODE: production
+      GROCY_DEFAULT_LOCALE: en
+      # Upstream default: public/.htaccess rewrites clean URLs (/stockoverview,
+      # /login) to index.php. No-rewrite mode also needs GROCY_BASE_PATH=/index.php
+      # and still emits /index.php/... URLs, so rewriting is kept enabled.
+      GROCY_DISABLE_URL_REWRITING: "false"
+      GROCY_BASE_PATH: ""
+      GROCY_BASE_URL: /
+      # Empty disables the OpenFoodFacts barcode plugin (no outbound calls).
+      GROCY_STOCK_BARCODE_LOOKUP_PLUGIN: ""
+      TZ: UTC
+    ports:
+      - "${PORT:-8088}:80"
+    volumes:
+      # Bind mount (not a named volume) so reset is a plain directory delete and
+      # the mutated source tree stays the only image input.
+      - ${DATA_DIR:-./.tester-env-data}:/data
